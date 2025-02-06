@@ -1,12 +1,22 @@
 import flwr as fl
-import tensorflow as tf
 import numpy as np
+import tensorflow as tf
 
-# Import the model from model.py
-from model import generate_ann
+NUM_CLIENTS = 5
 
-# Load and partition the dataset
-def load_datasets(cid: int):
+def unison_shuffled_copies(a, b):
+    assert len(a) == len(b)
+    p = np.random.permutation(len(a))
+    return a[p], b[p]
+
+def split_index(a, n):
+    s = np.array_split(np.arange(len(a)), n)
+    return s
+
+
+# Code to load the dataset
+def load_datasets(num_clients: int):
+    # Distribute it to train and test set
     (x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
     # Normalize data
     x_train = x_train.astype("float32") / 255.0
@@ -14,29 +24,35 @@ def load_datasets(cid: int):
 
     x_train, y_train = x_train[:10_000], y_train[:10_000]
     x_test, y_test = x_test[:1000], y_test[:1000]
-    
-    # Number of clients
-    num_clients = 5
 
-    # Split training set into partitions to simulate the individual dataset
-    x_train_splits = np.array_split(x_train, num_clients)
-    y_train_splits = np.array_split(y_train, num_clients)
+    # Randomize the datasets
+    x_train, y_train = unison_shuffled_copies(x_train, y_train)
+    x_test, y_test = unison_shuffled_copies(x_test, y_test)
 
-    x_val_splits = np.array_split(x_test, num_clients)
-    y_val_splits = np.array_split(y_test, num_clients)
+    # Split training set into NUM_CLIENTS partitions to simulate the individual dataset
+    train_index = split_index(x_train, num_clients)
+    test_index = split_index(x_test, num_clients)
 
-    # Select partition based on client id
-    x_train, y_train = x_train_splits[cid], y_train_splits[cid]
-    x_val, y_val = x_val_splits[cid], y_val_splits[cid]
-    
-    # Further split the training data to create validation set
-    split_point = int(len(x_train) * 0.9) # Using 90% of training data for actual training and 10% for validation
-    x_train, x_val = x_train[:split_point], x_train[split_point:]
-    y_train, y_val = y_train[:split_point], y_train[split_point:]
+    # Split each partition
+    train_ds = []
+    val_ds = []
+    test_ds = []
+    for cid in range(num_clients):
+        val_size = len(train_index[cid]) // 10
+        train_input_data, train_output_data = x_train[train_index[cid]], y_train[train_index[cid]]
+        val_input_data, val_output_data = train_input_data[:val_size], train_output_data[:val_size]
+        train_input_data, train_output_data = train_input_data[val_size:], train_output_data[val_size:]
+        train_dataset = (train_input_data, train_output_data)
+        val_dataset = (val_input_data, val_output_data)
+        test_dataset = (x_test[test_index[cid]], y_test[test_index[cid]])
+        train_ds.append(train_dataset)
+        val_ds.append(val_dataset)
+        test_ds.append(test_dataset)
+    return train_ds, val_ds, test_ds
 
-    return (x_train, y_train), (x_val, y_val)
+trainloaders, valloaders, testloader = load_datasets(NUM_CLIENTS)
 
-# Create a class to contain the details of the client and be the interface
+#Create a class to contain the details of the client and be the interface
 class MyClient(fl.client.NumPyClient):
     def __init__(self, net, train_dataset, test_dataset):
         self.model = net
@@ -56,14 +72,23 @@ class MyClient(fl.client.NumPyClient):
         loss, accuracy = self.model.evaluate(self.valloader[0], self.valloader[1])
         return loss, len(self.valloader[0]), {"accuracy": float(accuracy)}
 
-# The client_id will be an environment variable
-import os
-cid = int(os.environ["CLIENT_ID"])
-
-# Load the datasets based on the client id
-train_dataset, val_dataset = load_datasets(cid)
+def generate_ann():
+    model = tf.keras.Sequential(
+        [
+            tf.keras.layers.Flatten(input_shape=(32, 32, 3)),
+            tf.keras.layers.Dense(64, activation="relu"),
+            tf.keras.layers.Dense(64, activation="relu"),
+            tf.keras.layers.Dense(10, activation="softmax"),
+        ]
+    )
+    model.compile(
+        loss=tf.keras.losses.sparse_categorical_crossentropy,
+        optimizer=tf.keras.optimizers.Adam(),
+        metrics=["accuracy"],
+    )
+    return model
 
 # Start the client
 model = generate_ann()
 
-fl.client.start_numpy_client(server_address="localhost:8080", client=MyClient(model, train_dataset, val_dataset).to_client())
+fl.client.start_client(server_address=f"localhost:8080", client=MyClient(model,trainloaders[0],valloaders[0]).to_client())
